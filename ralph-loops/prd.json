@@ -110,7 +110,7 @@
         "Build and link succeed"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -128,7 +128,7 @@
         "Typecheck passes (Zig component)"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
