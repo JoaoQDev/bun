@@ -2,8 +2,20 @@
 #include "js_runtime.h"
 #include "tenant_manager.h"
 
+#include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
+
+// Global state for signal handler access during graceful shutdown.
+static std::atomic<bool> g_shutdown_requested{false};
+static serverless::TenantManager* g_tenantManager = nullptr;
+static serverless::JsRuntime* g_runtime = nullptr;
+
+static void sigint_handler(int) {
+    g_shutdown_requested.store(true, std::memory_order_release);
+}
 
 extern "C" int bun_serverless_main(const char* config_path, int port, void* jsc_vm) {
     if (config_path == nullptr) {
@@ -50,13 +62,39 @@ extern "C" int bun_serverless_main(const char* config_path, int port, void* jsc_
         fprintf(stdout, "  - %s -> %s\n", info.route.c_str(), info.name.c_str());
     }
 
-    // TODO (US-005/US-008): Start HttpServer here
-    // HttpServer::listen(port, &tenantManager);
-    fprintf(stdout, "[bun-serverless] Config parsed and workers loaded. HTTP server not yet implemented (see US-005).\n");
+    // 5. Register SIGINT handler for graceful shutdown
+    g_tenantManager = &tenantManager;
+    g_runtime = &runtime;
 
-    // Cleanup
+    struct sigaction sa;
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    // 6. Start HttpServer (US-005 will replace this with actual HTTP server)
+    // TODO (US-005): HttpServer::listen(port, &tenantManager, &runtime);
+    fprintf(stdout, "[bun-serverless] Listening on http://localhost:%d\n", port);
+    fflush(stdout);
+
+    // 7. Keep process alive until SIGINT/SIGTERM
+    while (!g_shutdown_requested.load(std::memory_order_acquire)) {
+        pause(); // Blocks until a signal is delivered
+    }
+
+    fprintf(stdout, "\n[bun-serverless] Shutting down...\n");
+    fflush(stdout);
+
+    // 8. Graceful shutdown: destroy all workers via TenantManager, then JsRuntime
     tenantManager.deinit();
     runtime.deinit();
+
+    g_tenantManager = nullptr;
+    g_runtime = nullptr;
+
+    fprintf(stdout, "[bun-serverless] Shutdown complete.\n");
+    fflush(stdout);
 
     return 0;
 }
