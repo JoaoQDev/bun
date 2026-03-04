@@ -1,0 +1,208 @@
+{
+  "project": "Bun Serverless Runtime (PoC)",
+  "branchName": "ralph/bun-serverless-runtime",
+  "description": "Serverless runtime for JS/TS workers built on Bun/JSC, with isolated GlobalObjects per worker, TenantManager for routing, and a POSIX HTTP server — invoked via `bun serverless`",
+  "userStories": [
+    {
+      "id": "US-000",
+      "title": "Integrate C++ files into Bun's build system",
+      "description": "As a developer, I need the new C++ files in src/serverless/ to be compiled and linked correctly in the Bun fork build, so that `bun serverless` is available after building.",
+      "acceptanceCriteria": [
+        "The .cpp files from src/serverless/ are added to the compiled sources list in the fork's build.zig",
+        "serverless_command.zig compiles alongside other src/cli/ files without modifying the existing directory structure",
+        "The function `extern \"C\" int bun_serverless_main(const char* config_path, int port)` exported by serverless_bootstrap.cpp is linked correctly and visible to Zig via `extern fn`",
+        "`bun build` (or the fork's equivalent build command) completes without errors after the changes",
+        "The resulting binary responds to `bun serverless --help` without symbol errors",
+        "Build and link succeed"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-001",
+      "title": "Parse workers config file (workers.json)",
+      "description": "As a developer, I want to define my workers in a config file so the runtime knows which JS/TS files serve which routes.",
+      "acceptanceCriteria": [
+        "The runtime accepts a workers.json file with format: { \"workers\": [{ \"name\": string, \"route\": string, \"script\": string }] }",
+        "Required fields: name, route, script. Missing field causes startup failure with error: Worker entry missing required field: \"<field>\"",
+        "Duplicate worker name causes startup failure with error: Duplicate worker name: \"<name>\"",
+        "The script field is resolved relative to the config file directory, not the process cwd",
+        "Clear error on startup if config file doesn't exist or has invalid JSON",
+        "Clear error if a referenced script file doesn't exist (after path resolution)",
+        "Build and link succeed"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Validate technical assumptions — GlobalObject, ESM, JS invocation",
+      "description": "As a runtime, I need to validate that the riskiest technical core works before building the full HTTP pipeline. This is the highest-risk step of the PoC.",
+      "acceptanceCriteria": [
+        "Instantiate a dedicated Zig::GlobalObject inside a shared JSC::VM",
+        "Load a trivial ESM module (export default { fetch() { return new Response(\"ok\") } }) in that GlobalObject's context",
+        "Extract the default export and verify it's an object with a callable fetch property",
+        "Invoke the fetch function from the default export with simple JS arguments and get a valid return (no HTTP pipeline)",
+        "Validate that `import { readFile } from \"node:fs/promises\"` works inside a module loaded in this context",
+        "Validate that the Promise returned by the fetch handler resolves correctly via JSC's event loop/microtask queue",
+        "All validation can be done via a standalone test or temporary main — no HttpServer dependency",
+        "The validation produces a standalone executable (e.g. src/serverless/validate_assumptions) that prints one line per validated hypothesis: checkmark + description",
+        "If any hypothesis fails, the executable prints X + failure description and exits with code 1",
+        "This artifact is the definitive pass/fail criterion for US-002",
+        "Build and link succeed"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "GATE: If this fails, the PoC approach needs to be reevaluated. Do not proceed to US-005 until this passes."
+    },
+    {
+      "id": "US-004",
+      "title": "Implement TenantManager and JsRuntime with separated responsibilities",
+      "description": "As a runtime, I need two components with clearly separated responsibilities: JsRuntime handles everything JSC-related; TenantManager handles worker registry, lifecycle, and routing.",
+      "acceptanceCriteria": [
+        "JsRuntime::init() creates a single JSC::VM instance for the process",
+        "JsRuntime::createWorker(scriptPath) creates a Zig::GlobalObject, loads script as ESM, extracts default export, returns opaque WorkerHandle*",
+        "JsRuntime::callFetch(handle, ...) acquires JSC lock, invokes fetch handler, awaits Promise, extracts status/headers/body, returns FetchResult (see FR-5)",
+        "JsRuntime::destroyWorker(handle) unprotects GlobalObject from GC and frees resources",
+        "JsRuntime::deinit() destroys all handles and the VM. Only place that destroys the VM",
+        "JsRuntime has no knowledge of route names, worker names, or routing logic",
+        "TenantManager::init(JsRuntime* runtime) initializes with reference to JsRuntime",
+        "TenantManager::loadWorker(name, route, scriptPath) calls runtime->createWorker(), stores Worker{ name, route, handle } in unordered_map",
+        "TenantManager::route(path) resolves which worker handles the path (exact match first, then longest prefix match for routes ending in /*)",
+        "TenantManager::deinit() iterates all workers and calls runtime->destroyWorker() for each",
+        "TenantManager does not include any JSC headers and does not call any JSC API directly",
+        "Build and link succeed"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Initialize one GlobalObject per worker on startup",
+      "description": "As a runtime, I need to create a dedicated JSC::GlobalObject for each worker defined in the config, to ensure state isolation between workers.",
+      "acceptanceCriteria": [
+        "For each entry in workers.json, JsRuntime creates a separate Zig::GlobalObject",
+        "All GlobalObjects share the same JSC::VM (created once during JsRuntime init)",
+        "The worker's script is loaded as an ES Module in the corresponding GlobalObject's context via JSC's module loader (not JSC::evaluate())",
+        "After module loading, JsRuntime extracts and stores the default export ({ fetch }) for use on each request",
+        "Failure to load a script (syntax error, invalid import, etc.) displays error and halts startup",
+        "The GlobalObject is protected from GC while the worker is active",
+        "Build and link succeed"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Define worker convention — export default { fetch } + Node.js APIs",
+      "description": "As a worker developer, I want a single clear convention for writing workers, with access to Node.js APIs already implemented by Bun.",
+      "acceptanceCriteria": [
+        "The worker exports `export default` with an object containing a fetch method",
+        "The runtime accesses the default export after ESM loading and verifies it's an object with a callable fetch property",
+        "If default export doesn't exist or fetch is not a function, runtime fails on startup with descriptive error (not per-request)",
+        "Inside the worker, these APIs are available via Bun's GlobalObject: fetch() global, crypto (Web Crypto), URL, URLSearchParams, TextEncoder, TextDecoder, Node.js APIs via static import",
+        "The second argument env passed to fetch is an empty JS object {} (placeholder for future compatibility)",
+        "Exporting only `export function fetch(...)` without `export default` results in startup error: Worker \"name\": default export must be an object with a fetch method",
+        "Build and link succeed"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Integrate with Bun CLI — `bun serverless` subcommand",
+      "description": "As a developer, I want to start the serverless runtime via `bun serverless` as a native CLI subcommand.",
+      "acceptanceCriteria": [
+        "New subcommand 'serverless' registered in Bun's main CLI dispatcher following existing subcommand patterns (enum tag + root command matcher)",
+        "Command file created (e.g. src/cli/serverless_command.zig) with exec function that parses --config <path> (default: ./workers.json) and --port <number> (default: 3000)",
+        "Accepts positional shortcut: `bun serverless ./workers.json` equals `--config ./workers.json`",
+        "Calls the serverless runtime bootstrap via extern C function: bun_serverless_main(config_path, port)",
+        "On error, prints clear message to stderr and returns exit code 1",
+        "On success, starts HTTP server and keeps process alive until SIGINT",
+        "`bun serverless --help` prints basic usage with options and examples",
+        "Typecheck passes (Zig component)"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Implement internal runtime bootstrap (serverless_bootstrap.cpp)",
+      "description": "As a runtime, I need an internal C++ entry point that orchestrates the complete startup: parse config, init JsRuntime, load workers via TenantManager, start HttpServer.",
+      "acceptanceCriteria": [
+        "serverless_bootstrap.cpp exports `extern \"C\" int bun_serverless_main(const char* config_path, int port)` as bootstrap function",
+        "Bootstrap executes sequence: Config::load() -> JsRuntime::init() -> TenantManager loads workers -> HttpServer::listen()",
+        "On startup, prints to stdout: [bun-serverless] Loaded N workers, worker list with routes, and Listening on http://localhost:<port>",
+        "Registers SIGINT handler for graceful shutdown: destroys all workers via TenantManager::deinit() and exits",
+        "Returns 0 on success (after graceful shutdown), or 1 on startup error",
+        "Build and link succeed"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "HTTP server that routes requests to workers",
+      "description": "As a developer, I want the runtime to start an HTTP server that automatically directs each request to the correct worker based on configured routes.",
+      "acceptanceCriteria": [
+        "Runtime starts HTTP server on configured port (default: 3000, overridden via --port or PORT env)",
+        "Path /_metrics is intercepted by HttpServer before routing and responded directly (see US-009)",
+        "Each HTTP request is routed via TenantManager::route(path) using the algorithm defined in FR-4",
+        "If no worker matches, returns 404 Not Found with body {\"error\":\"No worker found for route\"}",
+        "Runtime constructs a JS Request object (Web API) with method, full url, headers, and body (read entirely into memory)",
+        "Runtime calls JsRuntime::callFetch(handle, ...) to invoke the handler and get a FetchResult",
+        "FetchResult (status, headers, body) is serialized as HTTP response on the socket",
+        "If worker throws uncaught exception, returns 500 with body {\"error\":\"<exception message>\"}",
+        "If fetch handler returns a non-Response value, returns 500 with body {\"error\":\"Worker returned a non-Response value\"}",
+        "HTTP parser limits: HTTP/1.1 only, no keep-alive, 4MB max body (413 for larger), no chunked transfer, max 64 headers",
+        "Build and link succeed"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Basic metrics endpoint (/_metrics)",
+      "description": "As an operator, I want a GET /_metrics endpoint to see worker status and shared VM memory usage.",
+      "acceptanceCriteria": [
+        "GET /_metrics returns JSON with vm_heap_size_bytes, vm_heap_capacity_bytes, and workers array (name + route per worker)",
+        "vm_heap_size_bytes represents current total heap size of the shared VM",
+        "vm_heap_capacity_bytes represents total allocated heap capacity of the VM",
+        "Workers list is generated by TenantManager — contains only name and route, no per-worker memory field",
+        "Endpoint is intercepted and responded by HttpServer before routing to workers",
+        "GET /_metrics returns 200 OK",
+        "Any other HTTP method on /_metrics returns 405 Method Not Allowed",
+        "Build and link succeed"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Example workers and end-to-end validation",
+      "description": "As a developer, I want example workers and a workers.json ready to validate the runtime end-to-end with `bun serverless`.",
+      "acceptanceCriteria": [
+        "examples/workers.json contains at least two workers (hello and api)",
+        "examples/workers/hello.ts returns a simple text response",
+        "examples/workers/api.ts returns JSON and uses new URL() for internal routing",
+        "End-to-end validation via: bun serverless --config ./examples/workers.json --port 3000",
+        "curl http://localhost:3000/hello returns 200 OK with hello worker body",
+        "curl http://localhost:3000/api/health returns 200 OK with {\"status\":\"ok\"}",
+        "curl http://localhost:3000/nonexistent returns 404 with {\"error\":\"No worker found for route\"}",
+        "curl http://localhost:3000/_metrics returns valid JSON with VM heap metrics and loaded workers list"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

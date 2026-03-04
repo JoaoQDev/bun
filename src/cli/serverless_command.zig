@@ -6,12 +6,14 @@ const strings = bun.strings;
 
 pub const ServerlessCommand = struct {
     extern fn bun_serverless_main(config_path: [*:0]const u8, port: c_int) c_int;
+    extern fn bun_serverless_validate() c_int;
 
     pub fn exec(allocator: std.mem.Allocator) !void {
         _ = allocator;
         var config_path: ?[:0]const u8 = null;
         var port: u16 = 3000;
         var show_help = false;
+        var run_validate = false;
 
         var args_iter = ArgsIterator{ .buf = bun.argv };
         _ = args_iter.next(); // skip executable
@@ -20,6 +22,8 @@ pub const ServerlessCommand = struct {
         while (args_iter.next()) |arg| {
             if (strings.eqlComptime(arg, "--help") or strings.eqlComptime(arg, "-h")) {
                 show_help = true;
+            } else if (strings.eqlComptime(arg, "--validate")) {
+                run_validate = true;
             } else if (strings.eqlComptime(arg, "--config")) {
                 config_path = args_iter.next();
             } else if (strings.eqlComptime(arg, "--port")) {
@@ -42,6 +46,14 @@ pub const ServerlessCommand = struct {
             return;
         }
 
+        if (run_validate) {
+            const validate_result = bun_serverless_validate();
+            if (validate_result != 0) {
+                Global.exit(1);
+            }
+            return;
+        }
+
         const resolved_config = config_path orelse "./workers.json";
 
         const result = bun_serverless_main(resolved_config.ptr, @as(c_int, @intCast(port)));
@@ -59,6 +71,7 @@ pub const ServerlessCommand = struct {
             \\<b>Flags:<r>
             \\  <cyan>--config<r> FILE      Path to workers.json config file (default: ./workers.json)
             \\  <cyan>--port<r> NUMBER      Port to listen on (default: 3000)
+            \\  <cyan>--validate<r>         Run technical assumption validation (US-002)
             \\  <cyan>-h, --help<r>         Show this help message
             \\
             \\<b>Examples:<r>
