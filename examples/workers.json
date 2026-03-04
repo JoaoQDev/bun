@@ -1,0 +1,14 @@
+{
+  "workers": [
+    {
+      "name": "hello",
+      "route": "/hello",
+      "script": "./workers/hello.ts"
+    },
+    {
+      "name": "api",
+      "route": "/api/*",
+      "script": "./workers/api.ts"
+    }
+  ]
+}

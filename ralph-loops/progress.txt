@@ -170,3 +170,21 @@ Started: Wed Mar  4 17:30:22 -03 2026
   - US-009 was implemented ahead of time as part of US-005 (the HTTP server story). The /_metrics endpoint was included during HTTP server development since it shared the same request interception code path.
   - When stories share infrastructure (like HTTP routing), earlier stories may naturally satisfy later acceptance criteria.
 ---
+
+## 2026-03-04 - US-010
+- What was implemented: Example workers and end-to-end validation
+- Files changed:
+  - `examples/workers.json` — Config with 2 workers: hello (/hello) and api (/api/*)
+  - `examples/workers/hello.ts` — Simple text response worker
+  - `examples/workers/api.ts` — JSON API worker with URL-based internal routing (/api/health)
+- End-to-end validation results (all passing):
+  - `curl http://localhost:3456/hello` → 200, "Hello from bun-serverless!"
+  - `curl http://localhost:3456/api/health` → 200, `{"status":"ok"}`
+  - `curl http://localhost:3456/nonexistent` → 404, `{"error":"No worker found for route"}`
+  - `curl http://localhost:3456/_metrics` → 200, valid JSON with vm_heap_size_bytes, vm_heap_capacity_bytes, workers array
+  - `POST /_metrics` → 405 Method Not Allowed
+- **Learnings for future iterations:**
+  - The serverless runtime works end-to-end: config parsing, JSC init, ESM loading, routing, fetch invocation, HTTP response serialization
+  - `sleep 3` is needed after starting the server to allow JSC initialization and module loading before sending requests
+  - vm_heap_size_bytes may report 0 initially (before GC runs); vm_heap_capacity_bytes shows allocated capacity
+---

@@ -201,7 +201,7 @@
         "curl http://localhost:3000/_metrics returns valid JSON with VM heap metrics and loaded workers list"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "notes": ""
     }
   ]
