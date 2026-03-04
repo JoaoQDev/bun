@@ -93,6 +93,7 @@ pub const InitCommand = @import("./cli/init_command.zig").InitCommand;
 pub const WhyCommand = @import("./cli/why_command.zig").WhyCommand;
 pub const FuzzilliCommand = @import("./cli/fuzzilli_command.zig").FuzzilliCommand;
 pub const ReplCommand = @import("./cli/repl_command.zig").ReplCommand;
+pub const ServerlessCommand = @import("./cli/serverless_command.zig").ServerlessCommand;
 
 pub const Arguments = @import("./cli/Arguments.zig");
 
@@ -645,6 +646,7 @@ pub const Command = struct {
             RootCommandMatcher.case("prune") => .ReservedCommand,
             RootCommandMatcher.case("list") => .PackageManagerCommand,
             RootCommandMatcher.case("why") => .WhyCommand,
+            RootCommandMatcher.case("serverless") => .ServerlessCommand,
             RootCommandMatcher.case("fuzzilli") => if (bun.Environment.enable_fuzzilli)
                 .FuzzilliCommand
             else
@@ -984,6 +986,10 @@ pub const Command = struct {
                     try ExecCommand.exec(ctx);
                 } else Tag.printHelp(.ExecCommand, true);
             },
+            .ServerlessCommand => {
+                try ServerlessCommand.exec(allocator);
+                return;
+            },
             .FuzzilliCommand => {
                 if (bun.Environment.enable_fuzzilli) {
                     const ctx = try Command.init(allocator, log, .FuzzilliCommand);
@@ -1029,6 +1035,7 @@ pub const Command = struct {
         AuditCommand,
         WhyCommand,
         FuzzilliCommand,
+        ServerlessCommand,
 
         /// Used by crash reports.
         ///
@@ -1067,6 +1074,7 @@ pub const Command = struct {
                 .AuditCommand => 'A',
                 .WhyCommand => 'W',
                 .FuzzilliCommand => 'F',
+                .ServerlessCommand => 'S',
             };
         }
 
