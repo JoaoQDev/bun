@@ -1,3 +1,5 @@
+#include "worker_config.h"
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -12,9 +14,18 @@ extern "C" int bun_serverless_main(const char* config_path, int port) {
         return 1;
     }
 
-    // Placeholder: future stories will implement config parsing, JsRuntime, TenantManager, HttpServer
-    fprintf(stdout, "[bun-serverless] Starting with config: %s on port %d\n", config_path, port);
-    fprintf(stdout, "[bun-serverless] Runtime not yet implemented. See US-001 through US-010.\n");
+    // Parse config
+    bool config_ok = false;
+    auto config = serverless::WorkerConfig::load(config_path, config_ok);
+    if (!config_ok) {
+        return 1;
+    }
+
+    fprintf(stdout, "[bun-serverless] Loaded %zu workers:\n", config.workers.size());
+    for (const auto& w : config.workers) {
+        fprintf(stdout, "  - %s -> %s (%s)\n", w.route.c_str(), w.name.c_str(), w.script.c_str());
+    }
+    fprintf(stdout, "[bun-serverless] Config parsed successfully. Runtime not yet implemented (see US-002+).\n");
 
     return 0;
 }
