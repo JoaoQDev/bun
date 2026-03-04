@@ -987,7 +987,8 @@ pub const Command = struct {
                 } else Tag.printHelp(.ExecCommand, true);
             },
             .ServerlessCommand => {
-                try ServerlessCommand.exec(allocator);
+                const ctx = try Command.init(allocator, log, .ServerlessCommand);
+                try ServerlessCommand.exec(ctx);
                 return;
             },
             .FuzzilliCommand => {
@@ -1483,6 +1484,7 @@ pub const Command = struct {
             .PatchCommitCommand = false,
             .PublishCommand = false,
             .RemoveCommand = false,
+            .ServerlessCommand = false,
             .UnlinkCommand = false,
             .UpdateCommand = false,
         });

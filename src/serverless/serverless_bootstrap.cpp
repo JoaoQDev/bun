@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-extern "C" int bun_serverless_main(const char* config_path, int port) {
+extern "C" int bun_serverless_main(const char* config_path, int port, void* jsc_vm) {
     if (config_path == nullptr) {
         fprintf(stderr, "[bun-serverless] Error: config path is required\n");
         return 1;
@@ -23,9 +23,9 @@ extern "C" int bun_serverless_main(const char* config_path, int port) {
         return 1;
     }
 
-    // 2. Init JsRuntime (creates JSC::VM)
+    // 2. Init JsRuntime (uses the JSC::VM created by Zig)
     serverless::JsRuntime runtime;
-    if (!runtime.init()) {
+    if (!runtime.init(jsc_vm)) {
         fprintf(stderr, "[bun-serverless] Error: failed to initialize JS runtime\n");
         return 1;
     }

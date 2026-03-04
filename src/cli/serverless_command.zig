@@ -3,13 +3,17 @@ const bun = @import("bun");
 const Output = bun.Output;
 const Global = bun.Global;
 const strings = bun.strings;
+const jsc = bun.jsc;
+const js_ast = bun.ast;
+const Arena = bun.allocators.MimallocArena;
+const DNSResolver = bun.api.dns.Resolver;
+const Command = bun.cli.Command;
 
 pub const ServerlessCommand = struct {
-    extern fn bun_serverless_main(config_path: [*:0]const u8, port: c_int) c_int;
+    extern fn bun_serverless_main(config_path: [*:0]const u8, port: c_int, jsc_vm: *anyopaque) c_int;
     extern fn bun_serverless_validate() c_int;
 
-    pub fn exec(allocator: std.mem.Allocator) !void {
-        _ = allocator;
+    pub fn exec(ctx: Command.Context) !void {
         var config_path: ?[:0]const u8 = null;
         var port: u16 = 3000;
         var show_help = false;
@@ -34,7 +38,6 @@ pub const ServerlessCommand = struct {
                     };
                 }
             } else if (arg.len > 0 and arg[0] != '-') {
-                // Positional argument: treat as config path
                 if (config_path == null) {
                     config_path = arg;
                 }
@@ -56,11 +59,73 @@ pub const ServerlessCommand = struct {
 
         const resolved_config = config_path orelse "./workers.json";
 
-        const result = bun_serverless_main(resolved_config.ptr, @as(c_int, @intCast(port)));
-        if (result != 0) {
+        // Initialize JSC runtime — required for GlobalObject creation and ESM loading
+        bun.jsc.initialize(false);
+
+        js_ast.Expr.Data.Store.create();
+        js_ast.Stmt.Data.Store.create();
+        const arena = Arena.init();
+
+        const vm = try jsc.VirtualMachine.init(.{
+            .allocator = arena.allocator(),
+            .log = ctx.log,
+            .args = ctx.args,
+            .store_fd = false,
+            .smol = ctx.runtime_options.smol,
+            .dns_result_order = DNSResolver.Order.fromStringOrDie(ctx.runtime_options.dns_result_order),
+            .is_main_thread = true,
+        });
+
+        var b = &vm.transpiler;
+        vm.argv = ctx.passthrough;
+
+        b.options.install = ctx.install;
+        b.resolver.opts.install = ctx.install;
+        b.resolver.env_loader = b.env;
+        b.options.env.behavior = .load_all_without_inlining;
+
+        b.configureDefines() catch {
+            Output.flush();
+            const writer = Output.errorWriterBuffered();
+            defer Output.flush();
+            vm.log.print(writer) catch {};
             Global.exit(1);
-        }
+        };
+
+        bun.http.AsyncHTTP.loadEnv(vm.allocator, vm.log, b.env);
+        vm.loadExtraEnvAndSourceCodePrinter();
+
+        vm.is_main_thread = true;
+        jsc.VirtualMachine.is_main_thread_vm = true;
+
+        // Run the serverless bootstrap inside the JSC API lock.
+        // Required for safe JSC operations (GlobalObject creation, module loading).
+        var runner = ServerlessRunner{
+            .config_path = resolved_config,
+            .port = port,
+            .jsc_vm = vm.jsc_vm,
+        };
+
+        const callback = jsc.OpaqueWrap(ServerlessRunner, ServerlessRunner.start);
+        vm.global.vm().holdAPILock(&runner, callback);
     }
+
+    const ServerlessRunner = struct {
+        config_path: [:0]const u8,
+        port: u16,
+        jsc_vm: *anyopaque,
+
+        fn start(this: *ServerlessRunner) void {
+            const result = bun_serverless_main(
+                this.config_path.ptr,
+                @as(c_int, @intCast(this.port)),
+                this.jsc_vm,
+            );
+            if (result != 0) {
+                Global.exit(1);
+            }
+        }
+    };
 
     fn printHelp() void {
         Output.pretty(

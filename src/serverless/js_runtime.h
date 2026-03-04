@@ -31,10 +31,11 @@ public:
     JsRuntime();
     ~JsRuntime();
 
-    // Creates a single JSC::VM instance for the process.
+    // Initializes the runtime with the JSC::VM created by the Zig runtime.
+    // The jsc_vm parameter is a pointer to JSC::VM (passed as void* to avoid JSC headers in this header).
     // Must be called before any other method.
     // Returns true on success.
-    bool init();
+    bool init(void* jsc_vm);
 
     // Creates a Zig::GlobalObject, loads the ESM script, extracts `export default { fetch }`.
     // Returns an opaque WorkerHandle* on success, nullptr on failure.
