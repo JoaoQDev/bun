@@ -40,7 +40,8 @@ public:
     // Creates a Zig::GlobalObject, loads the ESM script, extracts `export default { fetch }`.
     // Returns an opaque WorkerHandle* on success, nullptr on failure.
     // On failure, prints an error to stderr.
-    WorkerHandle* createWorker(const std::string& scriptPath);
+    // workerName is used for descriptive error messages only.
+    WorkerHandle* createWorker(const std::string& scriptPath, const std::string& workerName);
 
     // Acquires JSC lock, invokes the fetch handler with the given request data,
     // awaits the returned Promise, extracts status/headers/body.

@@ -31,7 +31,7 @@ bool TenantManager::loadWorker(const std::string& name, const std::string& route
     }
 
     // Delegate to JsRuntime for all JSC work
-    WorkerHandle* handle = runtime_->createWorker(scriptPath);
+    WorkerHandle* handle = runtime_->createWorker(scriptPath, name);
     if (!handle) {
         fprintf(stderr, "[TenantManager] Error: failed to create worker \"%s\" from %s\n",
                 name.c_str(), scriptPath.c_str());

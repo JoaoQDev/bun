@@ -64,7 +64,7 @@ bool JsRuntime::init(void* jsc_vm) {
     return true;
 }
 
-WorkerHandle* JsRuntime::createWorker(const std::string& scriptPath) {
+WorkerHandle* JsRuntime::createWorker(const std::string& scriptPath, const std::string& workerName) {
     if (!impl_ || !impl_->initialized) {
         fprintf(stderr, "[JsRuntime] Error: runtime not initialized\n");
         return nullptr;
@@ -176,16 +176,26 @@ WorkerHandle* JsRuntime::createWorker(const std::string& scriptPath) {
     }
 
     if (defaultExportValue.isUndefinedOrNull()) {
-        fprintf(stderr, "[JsRuntime] Error: Worker \"%s\": no default export found. "
-                "Workers must use: export default { fetch(request, env) { ... } }\n",
-                scriptPath.c_str());
+        // Check if the module has a named 'fetch' export (common mistake: `export function fetch` without `export default`)
+        auto fetchIdent = JSC::Identifier::fromString(vm, "fetch"_s);
+        auto namedFetchValue = moduleNamespace->get(globalObject, fetchIdent);
+        if (scope.exception()) scope.clearException();
+
+        if (namedFetchValue.isCallable()) {
+            fprintf(stderr, "[JsRuntime] Error: Worker \"%s\": default export must be an object with a fetch method\n",
+                    workerName.c_str());
+        } else {
+            fprintf(stderr, "[JsRuntime] Error: Worker \"%s\": no default export found. "
+                    "Workers must use: export default { fetch(request, env) { ... } }\n",
+                    workerName.c_str());
+        }
         JSC::gcUnprotect(globalObject);
         return nullptr;
     }
 
     if (!defaultExportValue.isObject()) {
         fprintf(stderr, "[JsRuntime] Error: Worker \"%s\": default export must be an object with a fetch method\n",
-                scriptPath.c_str());
+                workerName.c_str());
         JSC::gcUnprotect(globalObject);
         return nullptr;
     }
@@ -198,15 +208,15 @@ WorkerHandle* JsRuntime::createWorker(const std::string& scriptPath) {
 
     if (scope.exception()) {
         scope.clearException();
-        fprintf(stderr, "[JsRuntime] Error: exception accessing fetch property for %s\n",
-                scriptPath.c_str());
+        fprintf(stderr, "[JsRuntime] Error: exception accessing fetch property for worker \"%s\"\n",
+                workerName.c_str());
         JSC::gcUnprotect(globalObject);
         return nullptr;
     }
 
     if (!fetchValue.isCallable()) {
         fprintf(stderr, "[JsRuntime] Error: Worker \"%s\": default export must be an object with a fetch method\n",
-                scriptPath.c_str());
+                workerName.c_str());
         JSC::gcUnprotect(globalObject);
         return nullptr;
     }
@@ -243,12 +253,13 @@ FetchResult JsRuntime::callFetch(WorkerHandle* handle,
 
     // TODO (US-005): Actual implementation:
     // 1. Acquire JSC lock (JSC::JSLockHolder)
-    // 2. Construct JS Request object from method, url, headers, body
-    // 3. Create empty env object {}
-    // 4. Call fetch(request, env) via JSC::call on the stored default export
+    // 2. Construct JS Request object (Web API) from method, url, headers, body
+    // 3. Create empty env object: JSC::constructEmptyObject(globalObject) — placeholder for future compatibility (US-006 convention)
+    // 4. Call fetch(request, env) via JSC::call on the stored default export's fetch property
     // 5. Await the returned Promise via vm.drainMicrotasks()
-    // 6. Extract Response: status, headers, body -> FetchResult
-    // 7. Handle exceptions -> FetchResult with ok=false
+    // 6. Verify result is a Response object; if not, return error: "Worker returned a non-Response value"
+    // 7. Extract Response: status, headers, body -> FetchResult
+    // 8. Handle exceptions -> FetchResult with ok=false, error = exception message
 
     result.error = "Not yet implemented (US-005)";
     return result;
