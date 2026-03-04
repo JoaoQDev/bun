@@ -159,3 +159,14 @@ Started: Wed Mar  4 17:30:22 -03 2026
   - The HTTP server runs inside holdAPILock context — JSC operations in callFetch work correctly
   - No keep-alive: Connection: close header sent on every response, socket closed after each request
 ---
+
+## 2026-03-04 - US-009
+- What was implemented: Verified all acceptance criteria already met by US-005 implementation
+- Files changed: No new code changes needed — all acceptance criteria were satisfied by existing implementation in http_server.cpp and js_runtime.cpp
+  - `src/serverless/http_server.cpp` — /_metrics intercept (lines 326-354): GET returns 200 with JSON metrics, non-GET returns 405
+  - `src/serverless/js_runtime.cpp` — heapSizeBytes() and heapCapacityBytes() using vm->heap.size()/capacity()
+  - `src/serverless/tenant_manager.h` — getWorkerInfos() returns WorkerInfo{name, route} per worker
+- **Learnings for future iterations:**
+  - US-009 was implemented ahead of time as part of US-005 (the HTTP server story). The /_metrics endpoint was included during HTTP server development since it shared the same request interception code path.
+  - When stories share infrastructure (like HTTP routing), earlier stories may naturally satisfy later acceptance criteria.
+---

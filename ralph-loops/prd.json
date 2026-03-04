@@ -183,7 +183,7 @@
         "Build and link succeed"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
