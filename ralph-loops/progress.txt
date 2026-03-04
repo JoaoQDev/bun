@@ -12,6 +12,10 @@ Started: Wed Mar  4 17:30:22 -03 2026
 - JSC function calls from C++: use `JSC::call()` or `JSC::profiledCall()` with `MarkedArgumentBuffer`.
 - New .cpp files in `src/serverless/` are auto-discovered by the build (glob in cmake/Sources.json). No need to manually register them.
 - Use pimpl idiom in serverless C++ headers to avoid leaking JSC includes to consumers (e.g., TenantManager).
+- To call JS constructors (e.g. `new Request()`) from C++: get constructor from globalObject, use `JSC::construct()` with `MarkedArgumentBuffer`.
+- To iterate Headers entries from C++: call `headers.entries()` to get iterator, then loop `next()` checking `done`/`value`.
+- Response body extraction: call `response.text()` which returns a Promise, drain microtasks, get result.
+- For POSIX HTTP server: use `poll()` with timeout on server socket to allow checking a shutdown flag between accepts.
 - Commands that need JSC must go through `Command.init()` + `VirtualMachine.init()` + `holdAPILock()`. Follow the REPL command pattern (repl_command.zig) for initialization sequence.
 - `uses_global_options` in cli.zig Tag must be set to false for commands that parse their own args (otherwise Bun's global arg parser intercepts --help, etc.).
 - `JSC::loadAndEvaluateModule()` resolves to undefined — use `globalObject->moduleLoader()->importModule()` to get a promise that resolves to the module namespace object.
@@ -125,4 +129,33 @@ Started: Wed Mar  4 17:30:22 -03 2026
   - US-007 was essentially completed across US-000 (initial CLI registration + build integration) and US-003 (rewrote to full JSC init path). Breaking the work into the right stories matters — this one was a no-op.
   - The CLI command correctly initializes JSC via the full path: jsc.initialize() -> AST stores -> VirtualMachine.init() -> holdAPILock() -> bun_serverless_main()
   - HTTP server start (AC6) is delegated to the bootstrap function which will be implemented in US-005/US-008
+---
+
+## 2026-03-04 - US-008
+- What was implemented: Complete bootstrap orchestration with SIGINT handler for graceful shutdown
+- Files changed:
+  - `src/serverless/serverless_bootstrap.cpp` — Added SIGINT/SIGTERM handler via sigaction, keep-alive loop via pause(), graceful shutdown sequence, proper startup messages including "Listening on http://localhost:<port>"
+- **Learnings for future iterations:**
+  - Use `sigaction` (not `signal`) for portable signal handling on POSIX — it gives control over sa_flags and mask
+  - `pause()` is the simplest way to block until a signal — no busy-wait needed
+  - Global atomic + global pointers pattern works for signal handler access to cleanup state (signal handlers can't safely access complex C++ objects, but setting an atomic flag is safe)
+  - The bootstrap runs inside Zig's `holdAPILock` — when US-005 adds the HTTP server, it will need to operate within this context
+  - `fflush(stdout)` after the "Listening" message is important since stdout may be line-buffered or fully-buffered when piped
+---
+
+## 2026-03-04 - US-005
+- What was implemented: HTTP server with POSIX sockets, request routing via TenantManager, full callFetch implementation with JS Request construction and Response extraction
+- Files changed:
+  - `src/serverless/http_server.h` — HttpServer class with listen() method
+  - `src/serverless/http_server.cpp` — POSIX socket HTTP/1.1 server: accept loop with poll(), request parsing, response serialization, /_metrics endpoint, 404/405/413/431/500 error handling
+  - `src/serverless/js_runtime.cpp` — Full callFetch implementation: constructs JS Request via constructor, calls fetch(req, env), drains Promise, extracts Response status/headers/body via JS APIs
+  - `src/serverless/serverless_bootstrap.cpp` — Replaced pause() loop with HttpServer::listen(), which handles the accept loop and shutdown flag
+- **Learnings for future iterations:**
+  - Creating JS objects from C++: get constructor from globalObject, build init with constructEmptyObject, call JSC::construct() with MarkedArgumentBuffer
+  - Response headers iteration: call entries() on Headers object, iterate via next()/done/value pattern
+  - Response body: call text() which returns a Promise, drain microtasks, get string result
+  - poll() with 500ms timeout is ideal for the accept loop — allows checking shutdown flag without busy-waiting
+  - /_metrics is intercepted before routing — already implemented here (not deferred to US-009)
+  - The HTTP server runs inside holdAPILock context — JSC operations in callFetch work correctly
+  - No keep-alive: Connection: close header sent on every response, socket closed after each request
 ---

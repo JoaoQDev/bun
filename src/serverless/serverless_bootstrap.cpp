@@ -1,6 +1,7 @@
 #include "worker_config.h"
 #include "js_runtime.h"
 #include "tenant_manager.h"
+#include "http_server.h"
 
 #include <atomic>
 #include <csignal>
@@ -73,20 +74,14 @@ extern "C" int bun_serverless_main(const char* config_path, int port, void* jsc_
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // 6. Start HttpServer (US-005 will replace this with actual HTTP server)
-    // TODO (US-005): HttpServer::listen(port, &tenantManager, &runtime);
-    fprintf(stdout, "[bun-serverless] Listening on http://localhost:%d\n", port);
-    fflush(stdout);
-
-    // 7. Keep process alive until SIGINT/SIGTERM
-    while (!g_shutdown_requested.load(std::memory_order_acquire)) {
-        pause(); // Blocks until a signal is delivered
-    }
+    // 6. Start HttpServer — blocks until shutdown is signaled
+    serverless::HttpServer httpServer;
+    int serverResult = httpServer.listen(port, &tenantManager, &runtime, &g_shutdown_requested);
 
     fprintf(stdout, "\n[bun-serverless] Shutting down...\n");
     fflush(stdout);
 
-    // 8. Graceful shutdown: destroy all workers via TenantManager, then JsRuntime
+    // 7. Graceful shutdown: destroy all workers via TenantManager, then JsRuntime
     tenantManager.deinit();
     runtime.deinit();
 
@@ -96,5 +91,5 @@ extern "C" int bun_serverless_main(const char* config_path, int port, void* jsc_
     fprintf(stdout, "[bun-serverless] Shutdown complete.\n");
     fflush(stdout);
 
-    return 0;
+    return serverResult;
 }

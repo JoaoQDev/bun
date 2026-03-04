@@ -16,6 +16,12 @@
 #include <JavaScriptCore/TopExceptionScope.h>
 #include <JavaScriptCore/Strong.h>
 #include <JavaScriptCore/SourceOrigin.h>
+#include <JavaScriptCore/ObjectConstructor.h>
+#include <JavaScriptCore/FunctionPrototype.h>
+#include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/IteratorOperations.h>
+#include <JavaScriptCore/ArrayPrototype.h>
+#include <JavaScriptCore/JSPromise.h>
 #include "ZigGlobalObject.h"
 #include "ScriptExecutionContext.h"
 
@@ -251,17 +257,232 @@ FetchResult JsRuntime::callFetch(WorkerHandle* handle,
         return result;
     }
 
-    // TODO (US-005): Actual implementation:
-    // 1. Acquire JSC lock (JSC::JSLockHolder)
-    // 2. Construct JS Request object (Web API) from method, url, headers, body
-    // 3. Create empty env object: JSC::constructEmptyObject(globalObject) — placeholder for future compatibility (US-006 convention)
-    // 4. Call fetch(request, env) via JSC::call on the stored default export's fetch property
-    // 5. Await the returned Promise via vm.drainMicrotasks()
-    // 6. Verify result is a Response object; if not, return error: "Worker returned a non-Response value"
-    // 7. Extract Response: status, headers, body -> FetchResult
-    // 8. Handle exceptions -> FetchResult with ok=false, error = exception message
+    JSC::VM& vm = *impl_->vm;
+    JSC::JSLockHolder locker(vm);
 
-    result.error = "Not yet implemented (US-005)";
+    auto* globalObject = handle->globalObject;
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+
+    // 1. Construct a JS Request object via `new Request(url, { method, headers, body })`
+    auto requestConstructorValue = globalObject->get(globalObject, JSC::Identifier::fromString(vm, "Request"_s));
+    if (scope.exception()) {
+        scope.clearException();
+        result.error = "Failed to get Request constructor";
+        return result;
+    }
+
+    auto* requestConstructor = JSC::jsDynamicCast<JSC::JSObject*>(requestConstructorValue);
+    if (!requestConstructor) {
+        result.error = "Request constructor not found";
+        return result;
+    }
+
+    // Build the init object: { method, headers: {}, body }
+    auto* initObj = JSC::constructEmptyObject(globalObject);
+
+    // Set method
+    initObj->putDirect(vm, JSC::Identifier::fromString(vm, "method"_s),
+                       JSC::jsString(vm, WTF::String::fromUTF8(method.c_str())));
+
+    // Set headers as a plain object
+    auto* headersObj = JSC::constructEmptyObject(globalObject);
+    for (const auto& h : headers) {
+        headersObj->putDirect(vm, JSC::Identifier::fromString(vm, WTF::String::fromUTF8(h.first.c_str())),
+                              JSC::jsString(vm, WTF::String::fromUTF8(h.second.c_str())));
+    }
+    initObj->putDirect(vm, JSC::Identifier::fromString(vm, "headers"_s), headersObj);
+
+    // Set body (only for methods that can have a body)
+    if (!body.empty() && method != "GET" && method != "HEAD") {
+        initObj->putDirect(vm, JSC::Identifier::fromString(vm, "body"_s),
+                           JSC::jsString(vm, WTF::String::fromUTF8(body.c_str())));
+    }
+
+    // Construct: new Request(url, init)
+    JSC::MarkedArgumentBuffer requestArgs;
+    requestArgs.append(JSC::jsString(vm, WTF::String::fromUTF8(url.c_str())));
+    requestArgs.append(initObj);
+
+    auto* requestObj = JSC::construct(globalObject, requestConstructor,
+                                      requestArgs, "Request"_s);
+    if (scope.exception()) {
+        auto* exception = scope.exception();
+        scope.clearException();
+        auto errorStr = exception->value().toWTFString(globalObject);
+        result.error = std::string(errorStr.utf8().data());
+        return result;
+    }
+
+    if (!requestObj) {
+        result.error = "Failed to construct Request object";
+        return result;
+    }
+
+    // 2. Create empty env object (placeholder per US-006 convention)
+    auto* envObj = JSC::constructEmptyObject(globalObject);
+
+    // 3. Call fetch(request, env) on the default export
+    auto fetchIdent = JSC::Identifier::fromString(vm, "fetch"_s);
+    auto fetchFnValue = handle->defaultExport.get()->get(globalObject, fetchIdent);
+    if (scope.exception()) {
+        scope.clearException();
+        result.error = "Failed to get fetch function from worker";
+        return result;
+    }
+
+    JSC::MarkedArgumentBuffer fetchArgs;
+    fetchArgs.append(requestObj);
+    fetchArgs.append(envObj);
+
+    auto fetchResultValue = JSC::call(globalObject, fetchFnValue,
+                                       handle->defaultExport.get(), fetchArgs, "fetch"_s);
+    if (scope.exception()) {
+        auto* exception = scope.exception();
+        scope.clearException();
+        auto errorStr = exception->value().toWTFString(globalObject);
+        result.error = std::string(errorStr.utf8().data());
+        return result;
+    }
+
+    // 4. If the result is a Promise, drain microtasks and resolve it
+    JSC::JSValue responseValue = fetchResultValue;
+    if (auto* promise = JSC::jsDynamicCast<JSC::JSPromise*>(fetchResultValue)) {
+        vm.drainMicrotasks();
+
+        auto status = promise->status();
+        if (status == JSC::JSPromise::Status::Rejected) {
+            auto rejectionValue = promise->result();
+            auto errorStr = rejectionValue.toWTFString(globalObject);
+            if (scope.exception()) scope.clearException();
+            result.error = std::string(errorStr.utf8().data());
+            return result;
+        }
+        if (status == JSC::JSPromise::Status::Pending) {
+            result.error = "Worker fetch handler did not resolve";
+            return result;
+        }
+        responseValue = promise->result();
+    }
+
+    // 5. Verify the result is a Response-like object with status/headers/text()
+    if (!responseValue.isObject()) {
+        result.error = "Worker returned a non-Response value";
+        return result;
+    }
+
+    auto* responseObj = responseValue.getObject();
+
+    // Check if it has a 'status' property (basic Response duck-typing)
+    auto statusIdent = JSC::Identifier::fromString(vm, "status"_s);
+    auto statusValue = responseObj->get(globalObject, statusIdent);
+    if (scope.exception()) {
+        scope.clearException();
+        result.error = "Worker returned a non-Response value";
+        return result;
+    }
+
+    if (!statusValue.isNumber()) {
+        result.error = "Worker returned a non-Response value";
+        return result;
+    }
+
+    result.status = statusValue.asNumber();
+
+    // 6. Extract headers via response.headers (a Headers object)
+    auto headersIdent = JSC::Identifier::fromString(vm, "headers"_s);
+    auto responseHeadersValue = responseObj->get(globalObject, headersIdent);
+    if (scope.exception()) scope.clearException();
+
+    if (responseHeadersValue.isObject()) {
+        // Call headers.entries() to iterate
+        auto* responseHeaders = responseHeadersValue.getObject();
+        auto forEachIdent = JSC::Identifier::fromString(vm, "forEach"_s);
+        auto forEachValue = responseHeaders->get(globalObject, forEachIdent);
+        if (scope.exception()) scope.clearException();
+
+        if (forEachValue.isCallable()) {
+            // Use a simpler approach: get known headers via get()
+            // Actually, let's use entries() and iterate
+            auto entriesIdent = JSC::Identifier::fromString(vm, "entries"_s);
+            auto entriesFnValue = responseHeaders->get(globalObject, entriesIdent);
+            if (scope.exception()) scope.clearException();
+
+            if (entriesFnValue.isCallable()) {
+                JSC::MarkedArgumentBuffer noArgs;
+                auto iteratorValue = JSC::call(globalObject, entriesFnValue,
+                                                responseHeaders, noArgs, "entries"_s);
+                if (scope.exception()) scope.clearException();
+
+                if (iteratorValue.isObject()) {
+                    auto* iterator = iteratorValue.getObject();
+                    auto nextIdent = JSC::Identifier::fromString(vm, "next"_s);
+
+                    for (int i = 0; i < 100; i++) { // Safety limit
+                        auto nextFnValue = iterator->get(globalObject, nextIdent);
+                        if (scope.exception()) { scope.clearException(); break; }
+                        if (!nextFnValue.isCallable()) break;
+
+                        auto iterResult = JSC::call(globalObject, nextFnValue,
+                                                     iterator, noArgs, "next"_s);
+                        if (scope.exception()) { scope.clearException(); break; }
+                        if (!iterResult.isObject()) break;
+
+                        auto* iterResultObj = iterResult.getObject();
+                        auto doneValue = iterResultObj->get(globalObject,
+                            JSC::Identifier::fromString(vm, "done"_s));
+                        if (scope.exception()) { scope.clearException(); break; }
+                        if (doneValue.isTrue()) break;
+
+                        auto entryValue = iterResultObj->get(globalObject,
+                            JSC::Identifier::fromString(vm, "value"_s));
+                        if (scope.exception()) { scope.clearException(); break; }
+                        if (!entryValue.isObject()) break;
+
+                        auto* entryArr = entryValue.getObject();
+                        auto nameVal = entryArr->getIndex(globalObject, 0);
+                        auto valVal = entryArr->getIndex(globalObject, 1);
+                        if (scope.exception()) { scope.clearException(); break; }
+
+                        if (nameVal.isString() && valVal.isString()) {
+                            auto nameStr = nameVal.toWTFString(globalObject);
+                            auto valStr = valVal.toWTFString(globalObject);
+                            result.headers.push_back({
+                                std::string(nameStr.utf8().data()),
+                                std::string(valStr.utf8().data())
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Extract body via response.text()
+    auto textIdent = JSC::Identifier::fromString(vm, "text"_s);
+    auto textFnValue = responseObj->get(globalObject, textIdent);
+    if (scope.exception()) scope.clearException();
+
+    if (textFnValue.isCallable()) {
+        JSC::MarkedArgumentBuffer noArgs;
+        auto textResult = JSC::call(globalObject, textFnValue,
+                                     responseObj, noArgs, "text"_s);
+        if (scope.exception()) {
+            scope.clearException();
+            result.body = "";
+        } else if (auto* textPromise = JSC::jsDynamicCast<JSC::JSPromise*>(textResult)) {
+            vm.drainMicrotasks();
+            if (textPromise->status() == JSC::JSPromise::Status::Fulfilled) {
+                auto bodyStr = textPromise->result().toWTFString(globalObject);
+                if (scope.exception()) scope.clearException();
+                result.body = std::string(bodyStr.utf8().data());
+            }
+        } else if (textResult.isString()) {
+            auto bodyStr = textResult.toWTFString(globalObject);
+            result.body = std::string(bodyStr.utf8().data());
+        }
+    }
+
+    result.ok = true;
     return result;
 }
 

@@ -144,7 +144,7 @@
         "Build and link succeed"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -165,7 +165,7 @@
         "Build and link succeed"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
