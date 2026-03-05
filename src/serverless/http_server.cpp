@@ -8,7 +8,6 @@
 #include <cstring>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -18,13 +17,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <picohttpparser/picohttpparser.h>
+#include <nlohmann/json.hpp>
+
 namespace serverless {
 
-static constexpr int MAX_HEADERS = 64;
-static constexpr size_t MAX_BODY_SIZE = 4 * 1024 * 1024; // 4MB
-static constexpr size_t MAX_HEADER_SECTION = 8192;        // 8KB for request line + headers
+static constexpr int    MAX_HEADERS      = 64;
+static constexpr size_t MAX_BODY_SIZE    = 4 * 1024 * 1024; // 4MB
+static constexpr size_t MAX_HEADER_SIZE  = 8192;             // 8KB
 
-// Parsed HTTP request.
 struct HttpRequest {
     std::string method;
     std::string path;
@@ -32,124 +33,80 @@ struct HttpRequest {
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
     bool valid = false;
-    int errorStatus = 0; // Non-zero if we should respond with an error immediately
+    int errorStatus = 0;
     std::string errorMessage;
 };
 
-// Read all data from a socket up to the end of the header section (\r\n\r\n),
-// then read body based on Content-Length.
 static HttpRequest parseRequest(int clientFd) {
     HttpRequest req;
 
-    // Read header section
-    std::string headerBuf;
-    headerBuf.reserve(4096);
-    char buf[4096];
-    size_t headerEnd = std::string::npos;
+    std::string buf;
+    buf.reserve(4096);
+    char tmp[4096];
 
-    while (headerEnd == std::string::npos) {
-        ssize_t n = ::read(clientFd, buf, sizeof(buf));
-        if (n <= 0) {
-            return req; // Connection closed or error
-        }
-        headerBuf.append(buf, static_cast<size_t>(n));
-        headerEnd = headerBuf.find("\r\n\r\n");
+    const char* method = nullptr;
+    size_t      method_len = 0;
+    const char* path = nullptr;
+    size_t      path_len = 0;
+    int         minor_version = 0;
+    struct phr_header headers[MAX_HEADERS];
+    size_t      num_headers = MAX_HEADERS;
+    size_t      last_len = 0;
+    int         pret = -2;
 
-        if (headerEnd == std::string::npos && headerBuf.size() > MAX_HEADER_SECTION) {
+    // Read until picohttpparser has a complete header section
+    while (pret == -2) {
+        ssize_t n = ::read(clientFd, tmp, sizeof(tmp));
+        if (n <= 0) return req;
+
+        buf.append(tmp, static_cast<size_t>(n));
+
+        if (buf.size() > MAX_HEADER_SIZE) {
             req.errorStatus = 431;
             req.errorMessage = "Request Header Fields Too Large";
             return req;
         }
+
+        num_headers = MAX_HEADERS;
+        pret = phr_parse_request(buf.c_str(), buf.size(),
+                                 &method, &method_len,
+                                 &path, &path_len,
+                                 &minor_version,
+                                 headers, &num_headers,
+                                 last_len);
+        last_len = buf.size();
     }
 
-    // Split header section from any body data already read
-    std::string headerSection = headerBuf.substr(0, headerEnd);
-    std::string bodyStart = headerBuf.substr(headerEnd + 4);
-
-    // Parse request line
-    size_t firstLine = headerSection.find("\r\n");
-    std::string requestLine = (firstLine != std::string::npos)
-        ? headerSection.substr(0, firstLine)
-        : headerSection;
-
-    // Parse: METHOD PATH HTTP/1.1
-    size_t sp1 = requestLine.find(' ');
-    if (sp1 == std::string::npos) {
-        req.errorStatus = 400;
-        req.errorMessage = "Bad Request";
-        return req;
-    }
-    size_t sp2 = requestLine.find(' ', sp1 + 1);
-    if (sp2 == std::string::npos) {
+    if (pret == -1) {
         req.errorStatus = 400;
         req.errorMessage = "Bad Request";
         return req;
     }
 
-    req.method = requestLine.substr(0, sp1);
-    req.path = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+    req.method = std::string(method, method_len);
+    req.path   = std::string(path, path_len);
 
-    std::string httpVersion = requestLine.substr(sp2 + 1);
-    if (httpVersion != "HTTP/1.1" && httpVersion != "HTTP/1.0") {
-        req.errorStatus = 505;
-        req.errorMessage = "HTTP Version Not Supported";
-        return req;
-    }
-
-    // Parse headers
-    std::string headersStr = (firstLine != std::string::npos)
-        ? headerSection.substr(firstLine + 2)
-        : "";
-
-    size_t pos = 0;
-    int headerCount = 0;
-    while (pos < headersStr.size()) {
-        size_t lineEnd = headersStr.find("\r\n", pos);
-        if (lineEnd == std::string::npos) lineEnd = headersStr.size();
-        std::string line = headersStr.substr(pos, lineEnd - pos);
-        pos = lineEnd + 2;
-
-        if (line.empty()) break;
-
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-
-        std::string name = line.substr(0, colon);
-        std::string value = line.substr(colon + 1);
-        // Trim leading whitespace from value
-        size_t valStart = value.find_first_not_of(' ');
-        if (valStart != std::string::npos) value = value.substr(valStart);
-
-        headerCount++;
-        if (headerCount > MAX_HEADERS) {
-            req.errorStatus = 431;
-            req.errorMessage = "Too many headers";
-            return req;
-        }
-
-        req.headers.push_back({name, value});
-    }
-
-    // Determine content length
+    // Collect headers, look for Content-Length / Transfer-Encoding / Host
     size_t contentLength = 0;
-    bool hasTransferEncodingChunked = false;
     std::string hostHeader;
-    for (const auto& h : req.headers) {
-        if (strcasecmp(h.first.c_str(), "Content-Length") == 0) {
-            contentLength = static_cast<size_t>(std::stoul(h.second));
-        } else if (strcasecmp(h.first.c_str(), "Transfer-Encoding") == 0) {
-            if (h.second.find("chunked") != std::string::npos) {
-                hasTransferEncodingChunked = true;
-            }
-        } else if (strcasecmp(h.first.c_str(), "Host") == 0) {
-            hostHeader = h.second;
-        }
-    }
 
-    if (hasTransferEncodingChunked) {
-        req.errorStatus = 411;
-        req.errorMessage = "Chunked transfer encoding not supported";
-        return req;
+    for (size_t i = 0; i < num_headers; i++) {
+        std::string name(headers[i].name, headers[i].name_len);
+        std::string value(headers[i].value, headers[i].value_len);
+
+        if (strcasecmp(name.c_str(), "content-length") == 0) {
+            contentLength = static_cast<size_t>(std::stoul(value));
+        } else if (strcasecmp(name.c_str(), "transfer-encoding") == 0) {
+            if (value.find("chunked") != std::string::npos) {
+                req.errorStatus = 411;
+                req.errorMessage = "Chunked transfer encoding not supported";
+                return req;
+            }
+        } else if (strcasecmp(name.c_str(), "host") == 0) {
+            hostHeader = value;
+        }
+
+        req.headers.push_back({std::move(name), std::move(value)});
     }
 
     if (contentLength > MAX_BODY_SIZE) {
@@ -158,52 +115,43 @@ static HttpRequest parseRequest(int clientFd) {
         return req;
     }
 
-    // Read body
-    req.body = bodyStart;
+    // Body: pret = bytes consumed by headers, rest of buf is body start
+    req.body = buf.substr(static_cast<size_t>(pret));
     while (req.body.size() < contentLength) {
-        ssize_t n = ::read(clientFd, buf, sizeof(buf));
+        ssize_t n = ::read(clientFd, tmp, sizeof(tmp));
         if (n <= 0) break;
-        req.body.append(buf, static_cast<size_t>(n));
+        req.body.append(tmp, static_cast<size_t>(n));
     }
-    if (req.body.size() > contentLength) {
+    if (req.body.size() > contentLength)
         req.body.resize(contentLength);
-    }
 
-    // Build full URL
     req.fullUrl = "http://" + (hostHeader.empty() ? "localhost" : hostHeader) + req.path;
-
     req.valid = true;
     return req;
 }
 
 static void sendResponse(int clientFd, int status, const std::string& statusText,
-                          const std::vector<std::pair<std::string, std::string>>& headers,
-                          const std::string& body) {
+                         const std::vector<std::pair<std::string, std::string>>& headers,
+                         const std::string& body) {
     std::ostringstream resp;
     resp << "HTTP/1.1 " << status << " " << statusText << "\r\n";
 
     bool hasContentLength = false;
-    bool hasContentType = false;
-    bool hasConnection = false;
+    bool hasContentType   = false;
+    bool hasConnection    = false;
+
     for (const auto& h : headers) {
         resp << h.first << ": " << h.second << "\r\n";
-        if (strcasecmp(h.first.c_str(), "Content-Length") == 0) hasContentLength = true;
-        if (strcasecmp(h.first.c_str(), "Content-Type") == 0) hasContentType = true;
-        if (strcasecmp(h.first.c_str(), "Connection") == 0) hasConnection = true;
+        if (strcasecmp(h.first.c_str(), "content-length") == 0) hasContentLength = true;
+        if (strcasecmp(h.first.c_str(), "content-type") == 0)   hasContentType   = true;
+        if (strcasecmp(h.first.c_str(), "connection") == 0)      hasConnection    = true;
     }
 
-    if (!hasContentLength) {
-        resp << "Content-Length: " << body.size() << "\r\n";
-    }
-    if (!hasContentType) {
-        resp << "Content-Type: text/plain\r\n";
-    }
-    if (!hasConnection) {
-        resp << "Connection: close\r\n";
-    }
+    if (!hasContentLength) resp << "Content-Length: " << body.size() << "\r\n";
+    if (!hasContentType)   resp << "Content-Type: text/plain\r\n";
+    if (!hasConnection)    resp << "Connection: close\r\n";
 
-    resp << "\r\n";
-    resp << body;
+    resp << "\r\n" << body;
 
     std::string responseStr = resp.str();
     const char* data = responseStr.c_str();
@@ -211,17 +159,15 @@ static void sendResponse(int clientFd, int status, const std::string& statusText
     while (remaining > 0) {
         ssize_t written = ::write(clientFd, data, remaining);
         if (written <= 0) break;
-        data += written;
+        data      += written;
         remaining -= static_cast<size_t>(written);
     }
 }
 
 static void sendJsonError(int clientFd, int status, const std::string& statusText,
-                           const std::string& errorMsg) {
-    std::string body = "{\"error\":\"" + errorMsg + "\"}";
-    std::vector<std::pair<std::string, std::string>> headers;
-    headers.push_back({"Content-Type", "application/json"});
-    sendResponse(clientFd, status, statusText, headers, body);
+                          const std::string& errorMsg) {
+    std::string body = nlohmann::json{{"error", errorMsg}}.dump();
+    sendResponse(clientFd, status, statusText, {{"Content-Type", "application/json"}}, body);
 }
 
 static std::string statusTextForCode(int code) {
@@ -235,7 +181,7 @@ static std::string statusTextForCode(int code) {
         case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 505: return "HTTP Version Not Supported";
-        default: return "Error";
+        default:  return "OK";
     }
 }
 
@@ -249,23 +195,21 @@ HttpServer::~HttpServer() {
 }
 
 int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtime,
-                        std::atomic<bool>* shutdownFlag) {
-    // Create socket
+                       std::atomic<bool>* shutdownFlag) {
     serverFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd_ < 0) {
         fprintf(stderr, "[HttpServer] Error: socket() failed: %s\n", strerror(errno));
         return 1;
     }
 
-    // Allow address reuse
     int opt = 1;
     setsockopt(serverFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_port        = htons(static_cast<uint16_t>(port));
 
     if (::bind(serverFd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         fprintf(stderr, "[HttpServer] Error: bind() failed on port %d: %s\n", port, strerror(errno));
@@ -284,20 +228,19 @@ int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtim
     fprintf(stdout, "[bun-serverless] Listening on http://localhost:%d\n", port);
     fflush(stdout);
 
-    // Main accept loop — use poll() so we can check the shutdown flag
     while (!shutdownFlag->load(std::memory_order_acquire)) {
         struct pollfd pfd;
-        pfd.fd = serverFd_;
-        pfd.events = POLLIN;
+        pfd.fd      = serverFd_;
+        pfd.events  = POLLIN;
         pfd.revents = 0;
 
-        int pollResult = ::poll(&pfd, 1, 500); // 500ms timeout
+        int pollResult = ::poll(&pfd, 1, 500);
         if (pollResult < 0) {
-            if (errno == EINTR) continue; // Signal interrupted, check shutdown flag
+            if (errno == EINTR) continue;
             fprintf(stderr, "[HttpServer] Error: poll() failed: %s\n", strerror(errno));
             break;
         }
-        if (pollResult == 0) continue; // Timeout, check shutdown flag
+        if (pollResult == 0) continue;
 
         int clientFd = ::accept(serverFd_, nullptr, nullptr);
         if (clientFd < 0) {
@@ -306,13 +249,12 @@ int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtim
             continue;
         }
 
-        // Parse the HTTP request
         HttpRequest httpReq = parseRequest(clientFd);
 
         if (httpReq.errorStatus != 0) {
             sendJsonError(clientFd, httpReq.errorStatus,
-                         statusTextForCode(httpReq.errorStatus),
-                         httpReq.errorMessage);
+                          statusTextForCode(httpReq.errorStatus),
+                          httpReq.errorMessage);
             ::close(clientFd);
             continue;
         }
@@ -322,38 +264,27 @@ int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtim
             continue;
         }
 
-        // Intercept /_metrics (handled by US-009, for now return 501)
+        // /_metrics endpoint
         if (httpReq.path == "/_metrics" || httpReq.path.find("/_metrics?") == 0) {
             if (httpReq.method != "GET") {
-                sendJsonError(clientFd, 405, "Method Not Allowed",
-                             "Method Not Allowed");
+                sendJsonError(clientFd, 405, "Method Not Allowed", "Method Not Allowed");
             } else {
-                // Build metrics JSON
-                size_t heapSize = runtime->heapSizeBytes();
-                size_t heapCapacity = runtime->heapCapacityBytes();
-                auto workerInfos = tenantManager->getWorkerInfos();
+                nlohmann::json j;
+                j["vm_heap_size_bytes"]     = runtime->heapSizeBytes();
+                j["vm_heap_capacity_bytes"] = runtime->heapCapacityBytes();
+                j["workers"]                = nlohmann::json::array();
+                for (const auto& info : tenantManager->getWorkerInfos())
+                    j["workers"].push_back({{"name", info.name}, {"route", info.route}});
 
-                std::ostringstream json;
-                json << "{\"vm_heap_size_bytes\":" << heapSize
-                     << ",\"vm_heap_capacity_bytes\":" << heapCapacity
-                     << ",\"workers\":[";
-                for (size_t i = 0; i < workerInfos.size(); i++) {
-                    if (i > 0) json << ",";
-                    json << "{\"name\":\"" << workerInfos[i].name
-                         << "\",\"route\":\"" << workerInfos[i].route << "\"}";
-                }
-                json << "]}";
-
-                std::string body = json.str();
-                std::vector<std::pair<std::string, std::string>> headers;
-                headers.push_back({"Content-Type", "application/json"});
-                sendResponse(clientFd, 200, "OK", headers, body);
+                sendResponse(clientFd, 200, "OK",
+                             {{"Content-Type", "application/json"}},
+                             j.dump());
             }
             ::close(clientFd);
             continue;
         }
 
-        // Route the request
+        // Route to worker
         Worker* worker = tenantManager->route(httpReq.path);
         if (!worker) {
             sendJsonError(clientFd, 404, "Not Found", "No worker found for route");
@@ -361,7 +292,6 @@ int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtim
             continue;
         }
 
-        // Call the worker's fetch handler
         FetchResult fetchResult = runtime->callFetch(
             worker->handle,
             httpReq.method,
@@ -373,12 +303,8 @@ int HttpServer::listen(int port, TenantManager* tenantManager, JsRuntime* runtim
         if (!fetchResult.ok) {
             sendJsonError(clientFd, 500, "Internal Server Error", fetchResult.error);
         } else {
-            std::string statusText = statusTextForCode(fetchResult.status);
-            if (statusText == "Error") {
-                // For non-standard status codes, use a generic text
-                statusText = "OK";
-            }
-            sendResponse(clientFd, fetchResult.status, statusText,
+            sendResponse(clientFd, fetchResult.status,
+                         statusTextForCode(fetchResult.status),
                          fetchResult.headers, fetchResult.body);
         }
 
